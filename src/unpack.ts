@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync, mkdirSync } from 'fs';
-import { join, dirname, relative, resolve } from 'path';
+import { join, dirname, relative, resolve, basename } from 'path';
+import { writeManifest } from './manifest.js';
 import * as t from '@babel/types';
 import { VISITOR_KEYS } from '@babel/types';
 import _generate from '@babel/generator';
@@ -254,6 +255,19 @@ export function unpack(bundlePath: string, outDir: string, chunkPaths: string[] 
   const fmt = getFormat(bundle.formatName);
   mkdirSync(outDir, { recursive: true });
   fmt?.writeRepackConfig?.(bundle, outDir, outputPaths);
+
+  // Write webpop.json manifest — records format/entry and per-module metadata for identify
+  // Keys are relative paths from outDir so nested layouts (dev bundles) work correctly
+  const absOut = resolve(outDir);
+  const entryFile = relative(absOut, outputPaths.get(bundle.entryId)!);
+  const modulesManifest: Record<string, { hintPath?: string }> = {};
+  for (const [id, mod] of bundle.modules) {
+    const file = relative(absOut, outputPaths.get(id)!);
+    const entry: Record<string, string> = {};
+    if (mod.hintPath) entry.hintPath = mod.hintPath;
+    modulesManifest[file] = entry;
+  }
+  writeManifest(outDir, { format: bundle.formatName, entry: entryFile, modules: modulesManifest });
 
   return { formatName: bundle.formatName, moduleCount: bundle.modules.size, entryId: bundle.entryId, outDir };
 }

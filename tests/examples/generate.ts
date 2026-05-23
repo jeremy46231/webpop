@@ -41,6 +41,7 @@ const projects: Project[] = [
   { name: 'wp5-prod-lodash', description: 'webpack 5 / production / npm deps (lodash, uuid)' },
   { name: 'wp5-ts',          description: 'webpack 5 / TypeScript via ts-loader / dev+prod' },
   { name: 'wp5-async-split', description: 'webpack 5 / dynamic imports + code splitting' },
+  { name: 'wp5-npm-multi',   description: 'webpack 5 / production / npm identify test (ms, semver, picocolors)' },
   { name: 'wp4-cjs-greet',   description: 'webpack 4 / CommonJS / dev+prod' },
   { name: 'wp4-babel-es6',   description: 'webpack 4 / babel-loader / ES6+ source / npm deps' },
   { name: 'wp3-legacy',      description: 'webpack 3 (legacy) / UglifyJsPlugin' },
