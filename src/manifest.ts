@@ -3,11 +3,14 @@ import { join } from 'path';
 
 export interface ModuleEntry {
   npm?: string;
+  hintPath?: string;
+  requireParamName?: string | null;
 }
 
 export interface WebpopManifest {
   format: string;
   entry: string | number;
+  chunkName?: string | null;
   modules: Record<string, ModuleEntry>;
 }
 

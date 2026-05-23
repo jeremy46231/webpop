@@ -30,7 +30,7 @@ function walk(root: t.Node, visit: (n: t.Node) => boolean | void): void {
     const keys = (VISITOR_KEYS as Record<string, readonly string[]>)[node.type];
     if (!keys) continue;
     for (const k of keys) {
-      const v = (node as Record<string, unknown>)[k];
+      const v = (node as unknown as Record<string, unknown>)[k];
       if (Array.isArray(v)) {
         for (const c of v) if (c && (c as t.Node).type) q.push(c as t.Node);
       } else if (v && (v as t.Node).type) {

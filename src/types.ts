@@ -17,6 +17,7 @@ export interface ParsedBundle {
   modules: Map<ModuleId, RawModule>;
   entryId: ModuleId;
   formatName: string;
+  chunkName?: string;
 }
 
 /**

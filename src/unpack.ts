@@ -165,7 +165,7 @@ function transformNode(
   const updates: Record<string, unknown> = {};
 
   for (const key of keys) {
-    const child = (node as Record<string, unknown>)[key];
+    const child = (node as unknown as Record<string, unknown>)[key];
     if (Array.isArray(child)) {
       let arrChanged = false;
       const next = (child as unknown[]).map(item => {
@@ -260,14 +260,20 @@ export function unpack(bundlePath: string, outDir: string, chunkPaths: string[] 
   // Keys are relative paths from outDir so nested layouts (dev bundles) work correctly
   const absOut = resolve(outDir);
   const entryFile = relative(absOut, outputPaths.get(bundle.entryId)!);
-  const modulesManifest: Record<string, { hintPath?: string }> = {};
+  const modulesManifest: Record<string, { hintPath?: string; requireParamName?: string | null }> = {};
   for (const [id, mod] of bundle.modules) {
     const file = relative(absOut, outputPaths.get(id)!);
-    const entry: Record<string, string> = {};
-    if (mod.hintPath) entry.hintPath = mod.hintPath;
-    modulesManifest[file] = entry;
+    modulesManifest[file] = {
+      ...(mod.hintPath ? { hintPath: mod.hintPath } : {}),
+      ...(mod.requireParamName ? { requireParamName: mod.requireParamName } : {}),
+    };
   }
-  writeManifest(outDir, { format: bundle.formatName, entry: entryFile, modules: modulesManifest });
+  writeManifest(outDir, {
+    format: bundle.formatName,
+    entry: entryFile,
+    chunkName: bundle.chunkName ?? null,
+    modules: modulesManifest,
+  });
 
   return { formatName: bundle.formatName, moduleCount: bundle.modules.size, entryId: bundle.entryId, outDir };
 }

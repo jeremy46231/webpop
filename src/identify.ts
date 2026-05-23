@@ -3,12 +3,94 @@
  * by comparing export key sets (Jaccard), string literal overlap (Dice), and path hints.
  */
 
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync } from 'fs';
-import { join, dirname, basename, relative } from 'path';
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync, unlinkSync } from 'fs';
+import { join, dirname, resolve, relative } from 'path';
 import { parse } from '@babel/parser';
 import * as t from '@babel/types';
 import { VISITOR_KEYS } from '@babel/types';
-import { readManifest, updateManifest } from './manifest.js';
+import { readManifest, updateManifest, type ModuleEntry } from './manifest.js';
+import { buildImportGraph, findExclusivelyCovered } from './graph.js';
+
+// ---------------------------------------------------------------------------
+// Package spec parsing:  ms  |  ms@2.1.3  |  lodash/chunk  |  react@18/jsx-runtime
+//                        @scope/pkg  |  @scope/pkg@1.0  |  @scope/pkg@1.0/sub
+// ---------------------------------------------------------------------------
+
+export interface PackageSpec {
+  name: string;        // npm package name, e.g. 'react' or '@scope/pkg'
+  version: string;     // version/range, '*' if not specified
+  subpath: string | null;
+  installSpec: string; // what to pass to `bun add`, e.g. 'react@18'
+  requireSpec: string; // what to put in require(), e.g. 'react/jsx-runtime'
+}
+
+export function parsePackageSpec(spec: string): PackageSpec {
+  let name: string;
+  let version = '*';
+  let subpath: string | null = null;
+
+  if (spec.startsWith('@')) {
+    // @scope/pkgname[@version][/subpath]
+    const scopeSlash = spec.indexOf('/', 1);
+    if (scopeSlash === -1) throw new Error(`Invalid scoped package: ${spec}`);
+    const rest = spec.slice(scopeSlash + 1); // 'pkgname[@version][/subpath]'
+    const atIdx = rest.indexOf('@');
+    const slashIdx = rest.indexOf('/');
+    if (atIdx !== -1 && (slashIdx === -1 || atIdx < slashIdx)) {
+      name = spec.slice(0, scopeSlash + 1 + atIdx);
+      const afterAt = rest.slice(atIdx + 1);
+      const subSlash = afterAt.indexOf('/');
+      if (subSlash === -1) { version = afterAt; }
+      else { version = afterAt.slice(0, subSlash); subpath = afterAt.slice(subSlash + 1); }
+    } else if (slashIdx !== -1) {
+      name = spec.slice(0, scopeSlash + 1 + slashIdx);
+      subpath = rest.slice(slashIdx + 1);
+    } else {
+      name = spec;
+    }
+  } else {
+    const atIdx = spec.indexOf('@');
+    const slashIdx = spec.indexOf('/');
+    if (atIdx !== -1 && (slashIdx === -1 || atIdx < slashIdx)) {
+      name = spec.slice(0, atIdx);
+      const afterAt = spec.slice(atIdx + 1);
+      const subSlash = afterAt.indexOf('/');
+      if (subSlash === -1) { version = afterAt; }
+      else { version = afterAt.slice(0, subSlash); subpath = afterAt.slice(subSlash + 1); }
+    } else if (slashIdx !== -1) {
+      name = spec.slice(0, slashIdx);
+      subpath = spec.slice(slashIdx + 1);
+    } else {
+      name = spec;
+    }
+  }
+
+  const installSpec = version !== '*' ? `${name}@${version}` : name;
+  const requireSpec = subpath ? `${name}/${subpath}` : name;
+  return { name, version, subpath, installSpec, requireSpec };
+}
+
+// ---------------------------------------------------------------------------
+// Backup types
+// ---------------------------------------------------------------------------
+
+const BACKUP_DIR = '.webpop-backup';
+
+interface BackupManifest {
+  pkg: string;
+  requireSpec: string;
+  moduleFile: string;
+  backedUpFiles: string[];
+  originalManifestEntries: Record<string, ModuleEntry>;
+}
+
+export interface ApplyResult {
+  moduleFile: string;
+  pkg: string;
+  requireSpec: string;
+  coveredCount: number;
+  backupDir: string;
+}
 
 // ---------------------------------------------------------------------------
 // AST helpers
@@ -22,7 +104,7 @@ function walkAst(root: t.Node, visit: (n: t.Node) => void): void {
     const keys = (VISITOR_KEYS as Record<string, readonly string[]>)[node.type];
     if (!keys) continue;
     for (const k of keys) {
-      const v = (node as Record<string, unknown>)[k];
+      const v = (node as unknown as Record<string, unknown>)[k];
       if (Array.isArray(v)) {
         for (const c of v) if (c && (c as t.Node).type) q.push(c as t.Node);
       } else if (v && (v as t.Node).type) q.push(v as t.Node);
@@ -169,34 +251,33 @@ console.log(JSON.stringify({
   try { return JSON.parse(out.trim()); } catch { return null; }
 }
 
-export async function getPackageInfo(pkg: string): Promise<PackageInfo | null> {
-  const tmpDir = join('/tmp', `webpop-probe-${pkg.replace(/[^a-z0-9]/gi, '_')}`);
+export async function getPackageInfo(specStr: string): Promise<PackageInfo | null> {
+  const spec = parsePackageSpec(specStr);
+  const tmpDir = join('/tmp', `webpop-probe-${spec.name.replace(/[^a-z0-9]/gi, '_')}`);
   mkdirSync(tmpDir, { recursive: true });
 
-  // Write minimal package.json so bun add works
-  const pkgJson = join(tmpDir, 'package.json');
-  if (!existsSync(pkgJson)) {
-    writeFileSync(pkgJson, JSON.stringify({ name: 'probe', private: true }, null, 2));
+  const pkgJsonPath = join(tmpDir, 'package.json');
+  if (!existsSync(pkgJsonPath)) {
+    writeFileSync(pkgJsonPath, JSON.stringify({ name: 'probe', private: true }, null, 2));
   }
 
-  // Install package
-  const install = Bun.spawn(['bun', 'add', pkg], { cwd: tmpDir, stdout: 'pipe', stderr: 'pipe' });
+  const install = Bun.spawn(['bun', 'add', spec.installSpec], { cwd: tmpDir, stdout: 'pipe', stderr: 'pipe' });
   const installCode = await install.exited;
   if (installCode !== 0) {
     const err = await new Response(install.stderr).text();
-    throw new Error(`Failed to install ${pkg}: ${err.trim()}`);
+    throw new Error(`Failed to install ${spec.installSpec}: ${err.trim()}`);
   }
 
-  const probe = await runProbe(tmpDir, pkg);
+  // Probe using the requireSpec (e.g. 'lodash/chunk') so we inspect the right export surface
+  const probe = await runProbe(tmpDir, spec.requireSpec);
   if (!probe) return null;
 
-  // Extract string literals from the package's source file
   let strings = new Set<string>();
   if (probe.sourceFile && existsSync(probe.sourceFile)) {
     strings = extractStringLiterals(probe.sourceFile);
   }
 
-  return { name: pkg, keys: probe.keys, isFunction: probe.isFunction, strings, sourceFile: probe.sourceFile };
+  return { name: spec.requireSpec, keys: probe.keys, isFunction: probe.isFunction, strings, sourceFile: probe.sourceFile };
 }
 
 // ---------------------------------------------------------------------------
@@ -273,11 +354,11 @@ export interface ModuleCandidate {
   hintPath: string | null;
 }
 
-// Recursively collect .js files relative to baseDir, skipping dist/ and .webpop-probe files
+// Recursively collect .js files relative to baseDir, skipping noise dirs/files
 function collectJsFiles(dir: string, baseDir: string): string[] {
   const results: string[] = [];
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    if (entry.name === 'dist' || entry.name === '.webpop-probe.cjs') continue;
+    if (entry.name === 'dist' || entry.name === '.webpop-probe.cjs' || entry.name === BACKUP_DIR) continue;
     const absPath = join(dir, entry.name);
     const relPath = relative(baseDir, absPath).replace(/\\/g, '/');
     if (entry.isDirectory()) {
@@ -330,52 +411,141 @@ export async function identifyPackages(
 
   const results: IdentifyResult[] = [];
 
-  for (const pkg of packages) {
-    onProgress?.(`  Fetching ${pkg}...`);
-    const info = await getPackageInfo(pkg);
-    if (!info) { onProgress?.(`  ✗ could not inspect ${pkg}`); continue; }
+  for (const specStr of packages) {
+    onProgress?.(`  Fetching ${specStr}...`);
+    const info = await getPackageInfo(specStr);
+    if (!info) { onProgress?.(`  ✗ could not inspect ${specStr}`); continue; }
 
     const matches: IdentifyMatch[] = mods
       .map(mod => ({ moduleFile: mod.file, score: scoreMatch(mod, info) }))
       .sort((a, b) => b.score.total - a.score.total);
 
-    results.push({ pkg, matches, info });
+    results.push({ pkg: specStr, matches, info });
   }
 
   return results;
 }
 
 // ---------------------------------------------------------------------------
-// Apply an identification: rewrite module as npm proxy, update package.json + manifest
+// Apply an identification: backup + delete covered modules, write npm proxy
 // ---------------------------------------------------------------------------
 
-export function applyIdentification(outDir: string, moduleFile: string, pkg: string): void {
-  // Rewrite the module file as an interop-aware proxy.
-  // TypeScript CJS packages set __esModule=true and put the real value at .default;
-  // plain CJS packages don't, and the module IS the value.  This handles both.
-  const absPath = join(outDir, moduleFile);
-  writeFileSync(absPath,
-    `const _m = require(${JSON.stringify(pkg)});\n` +
+export function applyIdentification(outDir: string, moduleFile: string, specStr: string): ApplyResult {
+  const spec = parsePackageSpec(specStr);
+  const manifest = readManifest(outDir);
+  const absOut = resolve(outDir);
+
+  // Build full import graph over all JS files in the tree
+  const allFiles = collectJsFiles(outDir, outDir);
+  const graph = buildImportGraph(allFiles, outDir);
+
+  // Entry from manifest (relative path like 'module___webpack_entry__.js')
+  const entryFile = manifest ? String(manifest.entry) : moduleFile;
+
+  // Modules exclusively reachable through `moduleFile` — safe to delete
+  const covered = findExclusivelyCovered(entryFile, moduleFile, graph);
+
+  // Save original manifest entries for all files we're touching
+  const originalEntries: Record<string, ModuleEntry> = {};
+  const allTouched = [moduleFile, ...covered];
+  for (const f of allTouched) {
+    originalEntries[f] = manifest?.modules?.[f] ?? {};
+  }
+
+  // Write backup: copy all touched files + manifest
+  const safePkgName = spec.name.replace(/\//g, '__').replace(/[^a-z0-9@_.-]/gi, '_');
+  const backupBase = join(absOut, BACKUP_DIR, safePkgName);
+  mkdirSync(backupBase, { recursive: true });
+  for (const f of allTouched) {
+    const src = join(absOut, f);
+    if (existsSync(src)) {
+      const dst = join(backupBase, f);
+      mkdirSync(dirname(dst), { recursive: true });
+      writeFileSync(dst, readFileSync(src));
+    }
+  }
+  const backupManifest: BackupManifest = {
+    pkg: spec.name,
+    requireSpec: spec.requireSpec,
+    moduleFile,
+    backedUpFiles: allTouched,
+    originalManifestEntries: originalEntries,
+  };
+  writeFileSync(join(backupBase, 'MANIFEST.json'), JSON.stringify(backupManifest, null, 2) + '\n');
+
+  // Delete exclusively covered files from tree
+  for (const f of covered) {
+    const abs = join(absOut, f);
+    if (existsSync(abs)) unlinkSync(abs);
+  }
+
+  // Rewrite module file as interop-aware npm proxy
+  writeFileSync(join(absOut, moduleFile),
+    `const _m = require(${JSON.stringify(spec.requireSpec)});\n` +
     `module.exports = _m && _m.__esModule ? _m.default : _m;\n`,
   );
 
-  // Add pkg to outDir's package.json dependencies
-  const pkgJsonPath = join(outDir, 'package.json');
+  // Add to package.json dependencies
+  const pkgJsonPath = join(absOut, 'package.json');
   if (existsSync(pkgJsonPath)) {
     const pkgJson = JSON.parse(readFileSync(pkgJsonPath, 'utf8'));
     pkgJson.dependencies = pkgJson.dependencies ?? {};
-    pkgJson.dependencies[pkg] = '*';
+    pkgJson.dependencies[spec.name] = spec.version !== '*' ? spec.version : '*';
     writeFileSync(pkgJsonPath, JSON.stringify(pkgJson, null, 2) + '\n');
   }
 
-  // Update manifest
-  updateManifest(outDir, m => ({
-    ...m,
-    modules: {
-      ...m.modules,
-      [moduleFile]: { ...m.modules[moduleFile], npm: pkg },
-    },
-  }));
+  // Update webpop.json: mark module as npm proxy, remove covered entries
+  updateManifest(outDir, m => {
+    const modules = { ...m.modules };
+    modules[moduleFile] = { ...modules[moduleFile], npm: spec.requireSpec };
+    for (const f of covered) delete modules[f];
+    return { ...m, modules };
+  });
+
+  return { moduleFile, pkg: spec.name, requireSpec: spec.requireSpec, coveredCount: covered.size, backupDir: backupBase };
+}
+
+// ---------------------------------------------------------------------------
+// Undo: restore backed-up files, remove proxy, update manifest
+// ---------------------------------------------------------------------------
+
+export function undoIdentification(outDir: string, pkgName: string): void {
+  const absOut = resolve(outDir);
+  const safePkgName = pkgName.replace(/\//g, '__').replace(/[^a-z0-9@_.-]/gi, '_');
+  const backupBase = join(absOut, BACKUP_DIR, safePkgName);
+  const manifestPath = join(backupBase, 'MANIFEST.json');
+  if (!existsSync(manifestPath)) throw new Error(`No backup found for ${pkgName} in ${backupBase}`);
+
+  const bm: BackupManifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+
+  // Restore all backed-up files
+  for (const f of bm.backedUpFiles) {
+    const src = join(backupBase, f);
+    const dst = join(absOut, f);
+    if (existsSync(src)) {
+      mkdirSync(dirname(dst), { recursive: true });
+      writeFileSync(dst, readFileSync(src));
+    }
+  }
+
+  // Remove from package.json
+  const pkgJsonPath = join(absOut, 'package.json');
+  if (existsSync(pkgJsonPath)) {
+    const pkgJson = JSON.parse(readFileSync(pkgJsonPath, 'utf8'));
+    if (pkgJson.dependencies) {
+      delete pkgJson.dependencies[bm.pkg];
+      writeFileSync(pkgJsonPath, JSON.stringify(pkgJson, null, 2) + '\n');
+    }
+  }
+
+  // Restore manifest entries
+  updateManifest(outDir, m => {
+    const modules = { ...m.modules };
+    for (const [f, entry] of Object.entries(bm.originalManifestEntries)) {
+      modules[f] = entry;
+    }
+    return { ...m, modules };
+  });
 }
 
 // ---------------------------------------------------------------------------
