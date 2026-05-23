@@ -20,6 +20,8 @@ function usage(): never {
   webpop repack <dir>
   webpop repack-push-chunk <dir>
   webpop analyze-slack <dir>
+  webpop scan-npm <dir> [--out report.json]
+  webpop organize <dir> [--mode graph|npm|flat]
   webpop identify <dir> <pkg[@ver][/sub]> ... [--apply] [--threshold <0-1>]
   webpop identify undo <dir> <pkg>
 `);
@@ -452,6 +454,264 @@ if (cmd === 'unpack') {
   console.log('');
   for (const cs of chunkStats.sort((a, b) => b.moduleCount - a.moduleCount)) {
     console.log(`  Chunk: ${cs.name.padEnd(50)} ${String(cs.moduleCount).padStart(5)} modules, ${cs.crossRefs} missing cross-refs`);
+  }
+
+} else if (cmd === 'scan-npm') {
+  // -------------------------------------------------------------------------
+  // scan-npm: fast heuristic pass to find npm packages across all modules
+  // Usage: webpop scan-npm <unpacked-dir> [--out <report.json>]
+  // -------------------------------------------------------------------------
+  const { positional, flags } = parseArgs(args);
+  const dir = resolve(positional[0] ?? '');
+  const outFile = flags['out'] as string | undefined ?? join(dir, 'npm-scan.json');
+
+  if (!dir || !existsSync(dir)) {
+    console.error('Usage: webpop scan-npm <unpacked-dir-or-chunk-dir> [--out report.json]');
+    process.exit(1);
+  }
+
+  // Collect all .js module files recursively (skip dist/, node_modules/, .webpop-backup/)
+  function collectModuleFiles(root: string): string[] {
+    const files: string[] = [];
+    function recurse(d: string) {
+      for (const entry of readdirSync(d, { withFileTypes: true })) {
+        if (entry.isDirectory()) {
+          const skip = ['node_modules', 'dist', '.webpop-backup', '.git'];
+          if (skip.includes(entry.name)) continue;
+          recurse(join(d, entry.name));
+        } else if (entry.name.endsWith('.js') && !entry.name.endsWith('.min.js')) {
+          files.push(join(d, entry.name));
+        }
+      }
+    }
+    recurse(root);
+    return files;
+  }
+
+  // License / package comment patterns
+  const LICENSE_RE = /\/\*!?\s*[\s\S]{0,200}?(?:@license|@preserve|copyright\s+\d{4})\s+[\s\S]{0,200}?\*\//gi;
+  const PKG_VERSION_RE = /["']([a-z@][a-z0-9@/_.-]{2,50})["']\s*[,:]\s*["'](\d+\.\d+[\d.a-z-]*)["']/gi;
+  const VERSION_VAR_RE = /(?:VERSION|version|__VERSION__)\s*[=:]\s*["'](\d+\.\d+[\d.a-z-]*)["']/gi;
+
+  // Known package fingerprints: unique strings that appear in specific packages
+  const FINGERPRINTS: Array<{ pkg: string; patterns: RegExp[] }> = [
+    { pkg: 'react', patterns: [/\breact\.createElement\b/, /react\.version\s*=/, /"react":\s*"[\d.]+"/] },
+    { pkg: 'react-dom', patterns: [/\breactDOM\.render\b/, /ReactDOM\.hydrate/, /\breact-dom\b/] },
+    { pkg: 'lodash', patterns: [/\blodash\s*@/, /lodash\/lodash\.js/, /var\s+VERSION\s*=\s*['"]4\.\d+\.\d+['"].*lodash/, /lodash\.com\/license/i] },
+    { pkg: 'underscore', patterns: [/\bunderscore\.js\b/, /Underscore\.js\s+\d+\.\d+/, /\b_\.VERSION\s*=/] },
+    { pkg: 'backbone', patterns: [/Backbone\.js\s+\d/, /Backbone\.View/, /Backbone\.Model/] },
+    { pkg: 'jquery', patterns: [/jQuery\s+v\d/, /\bjQuery\.fn\.jquery\b/, /\$\.fn\.jquery\s*=/] },
+    { pkg: 'moment', patterns: [/moment\.js\b/, /\bmoment\b[^a-z].*Moment is/, /moment\.utc\(/, /moment\.locale\(/] },
+    { pkg: 'dayjs', patterns: [/dayjs\s+v\d/, /\bdayjs\b.*mini.*dayjs/i] },
+    { pkg: 'axios', patterns: [/\baxios\b[^a-z]/, /axios\/lib\//, /\baxios\.create\b/] },
+    { pkg: 'bluebird', patterns: [/bluebird\s+@\d/, /Bluebird\s+[\d.]+/, /bluebird\.js/] },
+    { pkg: 'immutable', patterns: [/Immutable\.js\s+v\d/, /\bImmutable\.Map\b/, /\bImmutable\.List\b/] },
+    { pkg: 'redux', patterns: [/\bcreatStore\b|\bcreateStore\b.*redux/, /\bcombineReducers\b.*redux/, /redux\s+@\d/] },
+    { pkg: 'rxjs', patterns: [/\bRxJS\b.*\d+\.\d+/, /rxjs\/operators/, /\bObservable\b.*rxjs/] },
+    { pkg: 'classnames', patterns: [/\bclassNames\b.*\bclassnames\b/, /classnames@\d/] },
+    { pkg: 'prop-types', patterns: [/prop-types\s+@\d/, /\bPropTypes\b.*facebook/, /react\/lib\/ReactPropTypes/] },
+    { pkg: 'reselect', patterns: [/\bcreateSelector\b.*reselect/, /reselect@\d/] },
+    { pkg: 'immer', patterns: [/\bimmer\b.*Immer/, /\bproduce\b.*immer/, /immer@\d/] },
+    { pkg: 'typescript', patterns: [/typescript\s+@\d/, /Microsoft.*TypeScript/] },
+    { pkg: 'webpack', patterns: [/webpack\/lib\//, /webpack\s+@\d/] },
+    { pkg: 'highlight.js', patterns: [/highlight\.js\s+@\d/, /\bhljs\.highlight\b/, /hljs\.highlightElement/] },
+    { pkg: 'marked', patterns: [/marked\s+@\d/, /\bmarked\s*[\d.]+\s*-\s*a markdown parser/, /marked\.parse\(/] },
+    { pkg: 'prismjs', patterns: [/Prism\.js\s+@\d/, /\bPrism\.highlight\b/] },
+    { pkg: 'emoji-js', patterns: [/emoji\.js\b/, /emoji-js@\d/] },
+    { pkg: 'emoji-mart', patterns: [/emoji-mart@\d/, /\bemojiMart\b/] },
+    { pkg: 'dompurify', patterns: [/DOMPurify\s+\d+\.\d+/, /\bdompurify\b.*cure53/i] },
+    { pkg: 'sanitize-html', patterns: [/sanitize-html@\d/, /\bsanitizeHtml\b/] },
+    { pkg: 'quill', patterns: [/Quill\s+@\d/, /\bQuill\.import\b/, /quilljs\.com/] },
+    { pkg: 'draft-js', patterns: [/draft-js@\d/, /\bDraftEditor\b/, /\bEditorState\b.*DraftEditorContents/] },
+    { pkg: 'slate', patterns: [/slate@\d/, /\bSlate\b.*editor/, /\bTransforms\b.*slate/] },
+    { pkg: 'codemirror', patterns: [/CodeMirror\s+@\d/, /\bCodeMirror\b.*mode/, /codemirror\.net/] },
+    { pkg: 'uuid', patterns: [/\buuidv4\b|\buuid\.v4\b/, /uuid@\d/, /\bv4\b.*uuid.*rfc/i] },
+    { pkg: 'nanoid', patterns: [/nanoid@\d/, /\bnanoid\b.*\d+.*chars/] },
+    { pkg: 'classlist-polyfill', patterns: [/classList.*polyfill/i] },
+    { pkg: 'color', patterns: [/\bcolor\.js\b/, /color@\d+\.\d/, /\bColor\b.*hsl.*rgb.*hex/] },
+    { pkg: 'tinycolor2', patterns: [/tinycolor\s+@\d/, /\btinycolor\b.*Brian Grinstead/i] },
+    { pkg: 'chroma-js', patterns: [/chroma\.js\s+@\d/, /\bchroma\b.*Gregor Aisch/i] },
+    { pkg: 'gsap', patterns: [/\bGSAP\b.*TweenMax/, /gsap@\d/] },
+    { pkg: 'animejs', patterns: [/anime\.js\s+@\d/, /anime@\d/] },
+    { pkg: 'socket.io', patterns: [/socket\.io@\d/, /\bSocketIO\b/] },
+    { pkg: 'numeral', patterns: [/numeral\.js\b/, /numeral@\d/] },
+    { pkg: 'accounting', patterns: [/accounting\.js\b/, /accounting@\d/] },
+    { pkg: 'humanize-duration', patterns: [/humanize-duration@\d/, /\bhumanizeDuration\b/] },
+    { pkg: 'ms', patterns: [/\bms\.js\b/, /Convert time.*\bms\b/, / \bms\b.*vercel.com/i] },
+    { pkg: 'debounce', patterns: [/\bdebounce@\d/, /\bdebounce\b.*delay.*\btimer\b/] },
+    { pkg: 'throttle-debounce', patterns: [/throttle-debounce@\d/] },
+    { pkg: 'fuse.js', patterns: [/fuse\.js\s+@\d/, /Fuse\.js.*fuzzy/i] },
+    { pkg: 'lunr', patterns: [/lunr\s+@\d/, /\blunr\b.*Olivia Briggs/i, /lunr\.Builder\b/] },
+    { pkg: 'pako', patterns: [/pako\s+@\d/, /\bpako\.deflate\b/, /\bpako\.inflate\b/] },
+    { pkg: 'lz-string', patterns: [/lz-string@\d/, /\bLZString\b/] },
+    { pkg: 'localforage', patterns: [/localforage@\d/, /localForage\.config/] },
+    { pkg: 'idb', patterns: [/\bidb@\d/, /\bidb\b.*Jake Archibald/i] },
+    { pkg: 'workbox', patterns: [/workbox-\w+@\d/, /\bworkbox\b.*Google/] },
+    { pkg: 'flatpickr', patterns: [/flatpickr@\d/, /\bflatpickr\b.*calendar/i] },
+    { pkg: 'date-fns', patterns: [/date-fns@\d/, /\bdate-fns\b.*date utility/i] },
+    { pkg: 'popper.js', patterns: [/popper\.js\s+@\d/, /\bPopper\.js\b/, /\bcreatPopper\b|\bcreatePopper\b/] },
+    { pkg: 'tippy.js', patterns: [/tippy\.js\s+@\d/, /\btippy\b.*tooltip/i] },
+    { pkg: 'floating-ui', patterns: [/floating-ui@\d/, /\bfloating-ui\b/] },
+    { pkg: 'intersection-observer', patterns: [/IntersectionObserver.*polyfill/i] },
+    { pkg: 'resize-observer-polyfill', patterns: [/ResizeObserver.*polyfill/i] },
+    { pkg: 'web-vitals', patterns: [/web-vitals@\d/, /\bweb-vitals\b/] },
+    { pkg: 'sentry', patterns: [/@sentry\/\w+@\d/, /\bSentry\.init\b/, /sentry\.io/] },
+    { pkg: 'amplitude', patterns: [/amplitude-js@\d/, /\bAmplitude\b.*analytics/i] },
+    { pkg: 'mixpanel', patterns: [/mixpanel-browser@\d/, /\bmixpanel\.track\b/] },
+    { pkg: 'stripe', patterns: [/stripe\.js\b/, /\bStripe\b.*payment/i] },
+  ];
+
+  const files = collectModuleFiles(dir);
+  console.log(`Scanning ${files.length} module files in ${dir}...`);
+
+  // Results: Map<packageName, {files: string[], evidence: string[]}>
+  const results: Map<string, { files: string[]; evidence: string[] }> = new Map();
+
+  function addResult(pkg: string, file: string, evidence: string) {
+    const rel = relative(dir, file);
+    if (!results.has(pkg)) results.set(pkg, { files: [], evidence: [] });
+    const r = results.get(pkg)!;
+    if (!r.files.includes(rel)) r.files.push(rel);
+    if (!r.evidence.includes(evidence)) r.evidence.push(evidence);
+  }
+
+  for (const file of files) {
+    let src: string;
+    try { src = readFileSync(file, 'utf8'); } catch { continue; }
+
+    // 1. License comments
+    const licenseMatches = src.match(LICENSE_RE) ?? [];
+    for (const lic of licenseMatches) {
+      // Extract package name from license: e.g. "lodash v4.17.21" or "@license React"
+      const pkgM = lic.match(/(?:@license|@preserve)?\s+([a-zA-Z@][a-zA-Z0-9@/_.-]{2,40})\s+v?(\d+\.\d+)/);
+      if (pkgM) {
+        addResult(pkgM[1].toLowerCase().replace(/^@license\s+/i, '').trim(), file,
+          `license comment: ${lic.slice(0, 80).replace(/\n/g, ' ')}`);
+      }
+    }
+
+    // 2. Package version strings: {"name": "foo", "version": "1.2.3"} or "foo@1.2.3"
+    const pkgAtVer = src.matchAll(/"([a-z@][a-z0-9@/_.-]{2,40})@(\d+\.\d+[^ "']*)"/g);
+    for (const m of pkgAtVer) {
+      addResult(m[1], file, `"${m[1]}@${m[2]}"`);
+    }
+
+    // 3. Known fingerprints
+    for (const { pkg, patterns } of FINGERPRINTS) {
+      for (const pat of patterns) {
+        if (pat.test(src)) {
+          addResult(pkg, file, `fingerprint: ${pat.source.slice(0, 50)}`);
+          break;
+        }
+      }
+    }
+  }
+
+  // Sort by number of files descending
+  const sorted = [...results.entries()].sort((a, b) => b[1].files.length - a[1].files.length);
+
+  console.log(`\nFound ${sorted.length} npm packages:\n`);
+  for (const [pkg, { files: pkgFiles, evidence }] of sorted) {
+    console.log(`  ${pkg.padEnd(45)} ${pkgFiles.length} module(s)  — ${evidence[0]}`);
+  }
+
+  // Write JSON report
+  const report: Record<string, { modules: string[]; evidence: string[] }> = {};
+  for (const [pkg, { files: pkgFiles, evidence }] of sorted) {
+    report[pkg] = { modules: pkgFiles, evidence };
+  }
+  writeFileSync(outFile, JSON.stringify(report, null, 2) + '\n');
+  console.log(`\nReport written to ${outFile}`);
+
+} else if (cmd === 'organize') {
+  // -------------------------------------------------------------------------
+  // organize: arrange modules into a cleaner folder structure using import graph
+  // Usage: webpop organize <unpacked-chunk-dir> [--out <new-dir>] [--mode <mode>]
+  // Modes: graph (default) | npm | flat
+  // -------------------------------------------------------------------------
+  const { positional, flags } = parseArgs(args);
+  const dir = resolve(positional[0] ?? '');
+  const mode = (flags['mode'] as string | undefined) ?? 'graph';
+
+  if (!dir || !existsSync(dir)) {
+    console.error('Usage: webpop organize <unpacked-chunk-dir> [--mode graph|npm|flat]');
+    process.exit(1);
+  }
+
+  const manifest = readManifest(dir);
+  if (!manifest) {
+    console.error(`No webpop.json in ${dir}`);
+    process.exit(1);
+  }
+
+  // Build import graph from all module files
+  const moduleFiles = Object.keys(manifest.modules).filter(f =>
+    f.endsWith('.js') && f !== 'chunk_init.js' && !f.includes('webpack.config'),
+  );
+
+  // Parse require() calls in each module
+  const deps = new Map<string, Set<string>>();
+  for (const mf of moduleFiles) {
+    const fp = join(dir, mf);
+    if (!existsSync(fp)) continue;
+    const src = readFileSync(fp, 'utf8');
+    const myDeps = new Set<string>();
+    for (const m of src.matchAll(/require\(['"](\.[^'"]+)['"]\)/g)) {
+      const dep = m[1].replace(/^\.\//, '');
+      if (dep.endsWith('.js')) myDeps.add(dep);
+    }
+    deps.set(mf, myDeps);
+  }
+
+  // Compute in-degree (how many modules import each module)
+  const inDegree = new Map<string, number>();
+  for (const mf of moduleFiles) inDegree.set(mf, 0);
+  for (const [, myDeps] of deps) {
+    for (const dep of myDeps) {
+      inDegree.set(dep, (inDegree.get(dep) ?? 0) + 1);
+    }
+  }
+
+  if (mode === 'graph') {
+    // Cluster by import depth:
+    // - depth 0: entry / chunk_init
+    // - depth 1: directly imported by entry
+    // - shared/: imported by 3+ other modules
+    // - util/: small files (< 30 lines) imported by multiple
+    // - feature/: modules not in shared
+
+    // Simple approach: bucket by in-degree
+    const buckets: Record<string, string[]> = {
+      'shared/': [],    // in-degree >= 5
+      'util/': [],      // small + in-degree 2-4
+      'feature/': [],   // in-degree 0-1 (leaf / directly loaded)
+    };
+
+    for (const mf of moduleFiles) {
+      if (mf === 'chunk_init.js') continue;
+      const deg = inDegree.get(mf) ?? 0;
+      const lineCount = readFileSync(join(dir, mf), 'utf8').split('\n').length;
+      if (deg >= 5) buckets['shared/'].push(mf);
+      else if (deg >= 2 && lineCount < 80) buckets['util/'].push(mf);
+      else buckets['feature/'].push(mf);
+    }
+
+    // Print proposed structure
+    let total = 0;
+    for (const [folder, files] of Object.entries(buckets)) {
+      console.log(`\n${folder} (${files.length} modules):`);
+      for (const f of files.slice(0, 10)) {
+        const deg = inDegree.get(f) ?? 0;
+        console.log(`  ${f.padEnd(40)} ← ${deg} imports`);
+      }
+      if (files.length > 10) console.log(`  ... and ${files.length - 10} more`);
+      total += files.length;
+    }
+    console.log(`\nTotal: ${total} modules`);
+    console.log('\nTo apply: run this command with --apply (not yet implemented)');
+  } else {
+    console.error(`Unknown mode: ${mode}. Use: graph, npm, flat`);
+    process.exit(1);
   }
 
 } else {
