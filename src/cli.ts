@@ -270,9 +270,11 @@ if (cmd === 'unpack') {
     return changed ? { ...node, ...updates } : node;
   }
 
-  // Strip leading `var X = module` and `var Y = exports` shims from body
+  // Strip leading `var X = module` and `var Y = exports` shims, then rename
+  // all remaining references from the alias back to the canonical name so
+  // the code is still valid after the declarations are removed.
   function stripParamShims(stmts: t.Statement[]): t.Statement[] {
-    const result: t.Statement[] = [];
+    const renames = new Map<string, string>(); // alias → canonical
     let i = 0;
     while (i < stmts.length) {
       const stmt = stmts[i];
@@ -280,19 +282,53 @@ if (cmd === 'unpack') {
         t.isVariableDeclaration(stmt) &&
         stmt.kind === 'var' &&
         stmt.declarations.length === 1 &&
+        t.isIdentifier(stmt.declarations[0].id) &&
         t.isIdentifier(stmt.declarations[0].init) &&
         (
           (stmt.declarations[0].init as t.Identifier).name === 'module' ||
           (stmt.declarations[0].init as t.Identifier).name === 'exports'
         )
       ) {
+        const alias = (stmt.declarations[0].id as t.Identifier).name;
+        const canonical = (stmt.declarations[0].init as t.Identifier).name;
+        if (alias !== canonical) renames.set(alias, canonical);
         i++;
         continue;
       }
-      result.push(...stmts.slice(i));
       break;
     }
-    return result;
+    const remaining = stmts.slice(i);
+    if (renames.size === 0) return remaining;
+
+    // Walk AST and rename identifier references (skip binding positions)
+    function renameIdents(node: t.Node): t.Node {
+      if (t.isIdentifier(node)) {
+        const canon = renames.get(node.name);
+        // Don't rename if this node is a key in a MemberExpression (obj.alias)
+        return canon ? { ...node, name: canon } : node;
+      }
+      const updates: Record<string, unknown> = {};
+      let changed = false;
+      for (const key of Object.keys(node) as (keyof typeof node)[]) {
+        const child = (node as Record<string, unknown>)[key as string];
+        if (Array.isArray(child)) {
+          const arr = child.map(c =>
+            c && typeof c === 'object' && 'type' in c ? renameIdents(c as t.Node) : c,
+          );
+          if (arr.some((c, j) => c !== child[j])) { updates[key as string] = arr; changed = true; }
+        } else if (child && typeof child === 'object' && 'type' in child) {
+          // Skip renaming the left side of MemberExpression when computed is false
+          if (key === 'property' && t.isMemberExpression(node) && !node.computed) continue;
+          // Skip left side of ObjectProperty key when not computed
+          if (key === 'key' && (t.isObjectProperty(node) || t.isObjectMethod(node)) && !node.computed) continue;
+          const t2 = renameIdents(child as t.Node);
+          if (t2 !== child) { updates[key as string] = t2; changed = true; }
+        }
+      }
+      return changed ? { ...node, ...updates } : node;
+    }
+
+    return remaining.map(s => renameIdents(s) as t.Statement);
   }
 
   const factories: Array<[number, string]> = [];
