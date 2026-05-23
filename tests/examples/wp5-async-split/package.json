@@ -1,0 +1,10 @@
+{
+  "name": "example-wp5-async-split",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": { "build": "webpack" },
+  "devDependencies": {
+    "webpack": "^5.91.0",
+    "webpack-cli": "^5.1.4"
+  }
+}

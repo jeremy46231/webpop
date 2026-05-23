@@ -1,0 +1,9 @@
+{
+  "name": "example-wp3-legacy",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": { "build": "webpack" },
+  "devDependencies": {
+    "webpack": "^3.12.0"
+  }
+}
