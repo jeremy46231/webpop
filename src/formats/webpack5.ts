@@ -60,24 +60,18 @@ function factoryOf(node: t.Node): { params: t.Node[]; body: t.BlockStatement } |
   return null;
 }
 
-function needsShim(name: string | null): boolean {
-  if (!name) return false;
-  if (name === 'module' || name === 'exports') return false;
-  return true;
-}
+const WEBPACK_PARAM_NAMES = ['module', 'exports', '__webpack_require__'];
 
 function addParamShims(body: t.BlockStatement, params: t.Node[]): t.BlockStatement {
-  const modName = params[0] && t.isIdentifier(params[0]) ? params[0].name : null;
-  const expName = params[1] && t.isIdentifier(params[1]) ? params[1].name : null;
   const shims: t.Statement[] = [];
-  if (needsShim(modName))
+  for (let i = 0; i < Math.min(params.length, 3); i++) {
+    const p = params[i];
+    if (!t.isIdentifier(p)) continue;
+    if (p.name === WEBPACK_PARAM_NAMES[i]) continue;
     shims.push(t.variableDeclaration('var', [
-      t.variableDeclarator(t.identifier(modName!), t.identifier('module'))
+      t.variableDeclarator(t.identifier(p.name), t.identifier(WEBPACK_PARAM_NAMES[i])),
     ]));
-  if (needsShim(expName))
-    shims.push(t.variableDeclaration('var', [
-      t.variableDeclarator(t.identifier(expName!), t.identifier('exports'))
-    ]));
+  }
   if (shims.length === 0) return body;
   return t.blockStatement([...shims, ...body.body]);
 }
@@ -195,6 +189,117 @@ function findMinifiedEntry(stmts: t.Statement[]): ModuleId | null {
 }
 
 /**
+ * Async-split bundles: the module registry starts empty (r={}) and gets
+ * populated at runtime from chunk files.  The entry is an async IIFE at the
+ * end of a SequenceExpression:
+ *
+ *   function t(e){bootstrap}, t.m=r, ..., async function(){entry}()
+ *
+ * We find the loader name (t) from the `t.m=r` assignment, transform
+ *   `await t.e(N).then(t.bind(t, M))` → `t(M)`
+ * so that the existing replaceRequireCalls pass resolves t(M) to require(path).
+ */
+function findAsyncSplitMain(
+  stmts: t.Statement[],
+): { loaderName: string; entryBody: t.BlockStatement } | null {
+  for (const stmt of stmts) {
+    if (!t.isExpressionStatement(stmt)) continue;
+    const expr = stmt.expression;
+
+    // The last expr in the sequence must be: async function(){...}()
+    let lastExpr: t.Expression | null = null;
+    if (t.isSequenceExpression(expr)) {
+      lastExpr = expr.expressions[expr.expressions.length - 1];
+    } else if (t.isCallExpression(expr)) {
+      lastExpr = expr;
+    }
+    if (!lastExpr || !t.isCallExpression(lastExpr)) continue;
+    if (lastExpr.arguments.length !== 0) continue;
+    const callee = lastExpr.callee;
+    if (!t.isFunctionExpression(callee) || !callee.async || !t.isBlockStatement(callee.body))
+      continue;
+
+    // Extract loader name from t.m = r assignment in the sequence
+    let loaderName: string | null = null;
+    const seqExprs = t.isSequenceExpression(expr) ? expr.expressions : [];
+    for (const e of seqExprs) {
+      if (
+        t.isAssignmentExpression(e, { operator: '=' }) &&
+        t.isMemberExpression(e.left) &&
+        t.isIdentifier((e.left as t.MemberExpression).property, { name: 'm' })
+      ) {
+        const obj = (e.left as t.MemberExpression).object;
+        if (t.isIdentifier(obj)) { loaderName = obj.name; break; }
+      }
+    }
+    if (!loaderName) continue;
+
+    const entryBody = transformAsyncLoads(callee.body, loaderName);
+    return { loaderName, entryBody };
+  }
+  return null;
+}
+
+/**
+ * Recursively replace `await expr.then(loader.bind(loader, M))` with `loader(M)`.
+ * This converts async dynamic-import patterns to synchronous require-style calls.
+ */
+function transformAsyncLoads(root: t.Node, loaderName: string): t.BlockStatement {
+  return transformNodeForAsync(root, loaderName) as t.BlockStatement;
+}
+
+function transformNodeForAsync(node: t.Node, loaderName: string): t.Node {
+  if (t.isAwaitExpression(node)) {
+    const arg = node.argument;
+    if (t.isCallExpression(arg)) {
+      const callee = arg.callee;
+      if (
+        t.isMemberExpression(callee) &&
+        t.isIdentifier((callee as t.MemberExpression).property, { name: 'then' }) &&
+        arg.arguments.length === 1
+      ) {
+        const bindCall = arg.arguments[0];
+        if (t.isCallExpression(bindCall)) {
+          const bindCallee = bindCall.callee;
+          if (
+            t.isMemberExpression(bindCallee) &&
+            t.isIdentifier((bindCallee as t.MemberExpression).property, { name: 'bind' }) &&
+            bindCall.arguments.length === 2
+          ) {
+            const moduleIdArg = bindCall.arguments[1];
+            if (t.isNumericLiteral(moduleIdArg) || t.isStringLiteral(moduleIdArg)) {
+              return t.callExpression(t.identifier(loaderName), [moduleIdArg]);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  const keys = (VISITOR_KEYS as Record<string, readonly string[]>)[node.type];
+  if (!keys) return node;
+  let changed = false;
+  const updates: Record<string, unknown> = {};
+  for (const key of keys) {
+    const child = (node as Record<string, unknown>)[key];
+    if (Array.isArray(child)) {
+      let arrChanged = false;
+      const next = (child as unknown[]).map(item => {
+        if (!item || !(item as t.Node).type) return item;
+        const n2 = transformNodeForAsync(item as t.Node, loaderName);
+        if (n2 !== item) arrChanged = true;
+        return n2;
+      });
+      if (arrChanged) { updates[key] = next; changed = true; }
+    } else if (child && (child as t.Node).type) {
+      const n2 = transformNodeForAsync(child as t.Node, loaderName);
+      if (n2 !== child) { updates[key] = n2; changed = true; }
+    }
+  }
+  return changed ? { ...node, ...updates } : node;
+}
+
+/**
  * wp5 minified: module registry is a local variable whose value is an object of
  * function shorthands — e.g. `var t = { 889(t,e,r){…}, 243(t,e,r){…} }`.
  * Empty cache objects (var e = {}) are excluded by the factory-shape check.
@@ -302,6 +407,23 @@ function extractModules(
   let inlinedEntry: { body: t.BlockStatement; hintPath: string | null } | null = null;
   let bootstrapInlineEntry: { body: t.BlockStatement; requireName: string } | null = null;
 
+  // Phase 0: async-split bundles — empty module registry, async entry IIFE
+  const outerBodyEarly = getOuterIIFEBody(ast);
+  if (outerBodyEarly) {
+    const asyncSplit = findAsyncSplitMain(outerBodyEarly);
+    if (asyncSplit) {
+      const modules = new Map<ModuleId, RawModule>();
+      const id: ModuleId = '__webpack_entry__';
+      modules.set(id, {
+        id,
+        hintPath: 'entry.js',
+        requireParamName: asyncSplit.loaderName,
+        body: asyncSplit.entryBody,
+      });
+      return { modules, entryId: id };
+    }
+  }
+
   // Phase 1: named-identifier scan (dev bundles with __webpack_modules__)
   walk(ast, (node) => {
     if (!t.isVariableDeclarator(node) || !t.isIdentifier(node.id)) return;
@@ -326,7 +448,7 @@ function extractModules(
   });
 
   // Phase 2: structural scan for minified / ESM-with-inlined-entry variants
-  const outerBody = getOuterIIFEBody(ast);
+  const outerBody = outerBodyEarly;
   if (outerBody) {
     if (!modulesNode) {
       modulesNode = findMinifiedModules(outerBody);
@@ -460,8 +582,10 @@ export const webpack5: Format = {
     // Dev: __webpack_modules__ appears as a variable declaration (not just in a comment)
     if (source.includes('var __webpack_modules__') && source.includes('__webpack_require__')) return true;
     // Minified prod: module registry stored as object with numeric shorthand methods
-    // e.g.  var t = { 889(t,e,r){ ... }, 243(t,e,r){ ... } }
-    return /\bvar\s+\w+\s*=\s*\{\s*\d+\s*\(/.test(source);
+    if (/\bvar\s+\w+\s*=\s*\{\s*\d+\s*\(/.test(source)) return true;
+    // Async-split main: arrow IIFE with Promise.all chunk loading
+    if (source.trimStart().startsWith('(()=>{') && source.includes('Promise.all(')) return true;
+    return false;
   },
 
   parse(source): ParsedBundle {

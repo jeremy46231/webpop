@@ -69,24 +69,18 @@ function factoryOf(node: t.Node): { params: t.Node[]; body: t.BlockStatement } |
   return null;
 }
 
-function needsShim(name: string | null): boolean {
-  if (!name) return false;
-  if (name === 'module' || name === 'exports') return false;
-  return true;
-}
+const WEBPACK_PARAM_NAMES = ['module', 'exports', '__webpack_require__'];
 
 function addParamShims(body: t.BlockStatement, params: t.Node[]): t.BlockStatement {
-  const modName = params[0] && t.isIdentifier(params[0]) ? params[0].name : null;
-  const expName = params[1] && t.isIdentifier(params[1]) ? params[1].name : null;
   const shims: t.Statement[] = [];
-  if (needsShim(modName))
+  for (let i = 0; i < Math.min(params.length, 3); i++) {
+    const p = params[i];
+    if (!t.isIdentifier(p)) continue;
+    if (p.name === WEBPACK_PARAM_NAMES[i]) continue;
     shims.push(t.variableDeclaration('var', [
-      t.variableDeclarator(t.identifier(modName!), t.identifier('module'))
+      t.variableDeclarator(t.identifier(p.name), t.identifier(WEBPACK_PARAM_NAMES[i])),
     ]));
-  if (needsShim(expName))
-    shims.push(t.variableDeclaration('var', [
-      t.variableDeclarator(t.identifier(expName!), t.identifier('exports'))
-    ]));
+  }
   if (shims.length === 0) return body;
   return t.blockStatement([...shims, ...body.body]);
 }

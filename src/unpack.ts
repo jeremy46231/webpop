@@ -4,6 +4,7 @@ import * as t from '@babel/types';
 import { VISITOR_KEYS } from '@babel/types';
 import _generate from '@babel/generator';
 import { detectAndParse, getFormat } from './detect.js';
+import { isChunk, parseChunkModules } from './formats/webpack-chunk.js';
 import type { ModuleId, ParsedBundle, RawModule } from './types.js';
 
 const generate = ((_generate as unknown as Record<string, unknown>).default ?? _generate) as typeof _generate;
@@ -28,9 +29,90 @@ const replaceRequireCalls: TransformPass = (body, { mod, resolveId }) => {
   return transformNode(body, mod.requireParamName, resolveId) as t.BlockStatement;
 };
 
+/**
+ * Convert webpack's ESM export runtime helpers to plain CJS so that the
+ * repacked bundle doesn't need __webpack_require__.d / .r in scope:
+ *
+ *   reqName.r(target)                    → (removed)
+ *   reqName.d(target, {k: () => v, …})  → target.k = v  (one per entry)
+ *
+ * These calls appear at the top level of ESM module bodies (both dev and
+ * minified).  Handling them here means the repacked bundle stays CJS-clean.
+ */
+const replaceWebpackHelpers: TransformPass = (body, { mod }) => {
+  if (!mod.requireParamName) return body;
+  const req = mod.requireParamName;
+
+  // Export assignments are moved to the END of the body so that `const`
+  // bindings are initialized before they're assigned to exports.
+  const newStmts: t.Statement[] = [];
+  const exportAssignments: t.Statement[] = [];
+
+  for (const stmt of body.body) {
+    if (!t.isExpressionStatement(stmt)) { newStmts.push(stmt); continue; }
+    const expr = stmt.expression;
+    if (!t.isCallExpression(expr)) { newStmts.push(stmt); continue; }
+    const { callee, arguments: args } = expr;
+    if (!t.isMemberExpression(callee)) { newStmts.push(stmt); continue; }
+    const obj = (callee as t.MemberExpression).object;
+    const prop = (callee as t.MemberExpression).property;
+    if (!t.isIdentifier(obj, { name: req })) { newStmts.push(stmt); continue; }
+
+    if (t.isIdentifier(prop, { name: 'r' })) {
+      // reqName.r(target) — marks module as ESM; drop it
+      continue;
+    }
+
+    if (t.isIdentifier(prop, { name: 'd' }) && args.length >= 2) {
+      // wp5: reqName.d(target, {k: () => v})
+      // wp4: reqName.d(target, "k", function() { return v; })
+      const target = args[0] as t.Expression;
+
+      const extractValue = (v: t.Node): t.Expression | null => {
+        if ((t.isArrowFunctionExpression(v) || t.isFunctionExpression(v)) && !t.isBlockStatement(v.body))
+          return v.body as t.Expression;
+        if ((t.isArrowFunctionExpression(v) || t.isFunctionExpression(v)) && t.isBlockStatement(v.body)) {
+          const ss = (v.body as t.BlockStatement).body;
+          if (ss.length === 1 && t.isReturnStatement(ss[0]) && ss[0].argument) return ss[0].argument;
+        }
+        return null;
+      };
+
+      if (args.length === 2 && t.isObjectExpression(args[1])) {
+        // webpack 5 form
+        for (const dp of (args[1] as t.ObjectExpression).properties) {
+          if (!t.isObjectProperty(dp) && !t.isObjectMethod(dp)) continue;
+          const key = (dp as t.ObjectProperty | t.ObjectMethod).key;
+          let keyExpr: t.Expression | null = null;
+          if (t.isIdentifier(key)) keyExpr = t.identifier(key.name);
+          else if (t.isStringLiteral(key)) keyExpr = t.stringLiteral(key.value);
+          if (!keyExpr) continue;
+          const value = t.isObjectProperty(dp) ? extractValue((dp as t.ObjectProperty).value) : null;
+          if (value)
+            exportAssignments.push(t.expressionStatement(
+              t.assignmentExpression('=', t.memberExpression(target, keyExpr, t.isStringLiteral(keyExpr)), value),
+            ));
+        }
+      } else if (args.length === 3 && (t.isStringLiteral(args[1]) || t.isIdentifier(args[1]))) {
+        // webpack 4 form: reqName.d(target, "key", getter)
+        const keyName = t.isStringLiteral(args[1]) ? args[1].value : (args[1] as t.Identifier).name;
+        const value = extractValue(args[2]);
+        if (value)
+          exportAssignments.push(t.expressionStatement(
+            t.assignmentExpression('=', t.memberExpression(target, t.identifier(keyName)), value),
+          ));
+      }
+      continue;
+    }
+
+    newStmts.push(stmt);
+  }
+  return t.blockStatement([...newStmts, ...exportAssignments]);
+};
+
 const PASSES: TransformPass[] = [
+  replaceWebpackHelpers,
   replaceRequireCalls,
-  // future: renameIdentifiers, inlineConstants, ...
 ];
 
 // ---------------------------------------------------------------------------
@@ -56,6 +138,23 @@ function transformNode(
     if (id !== null) {
       return t.callExpression(t.identifier('require'), [t.stringLiteral(resolveId(id))]);
     }
+  }
+
+  // shimName.n(m) → Object.assign(()=>m, {a:m})
+  // Polyfills __webpack_require__.n(mod) — the CJS/ESM interop wrapper.
+  if (
+    t.isCallExpression(node) &&
+    t.isMemberExpression(node.callee) &&
+    t.isIdentifier((node.callee as t.MemberExpression).object, { name: shimName }) &&
+    t.isIdentifier((node.callee as t.MemberExpression).property, { name: 'n' }) &&
+    node.arguments.length === 1 &&
+    t.isExpression(node.arguments[0])
+  ) {
+    const m = node.arguments[0] as t.Expression;
+    return t.callExpression(t.memberExpression(t.identifier('Object'), t.identifier('assign')), [
+      t.arrowFunctionExpression([], m),
+      t.objectExpression([t.objectProperty(t.identifier('a'), m)]),
+    ]);
   }
 
   const keys = (VISITOR_KEYS as Record<string, readonly string[]>)[node.type];
@@ -121,9 +220,19 @@ export interface UnpackResult {
   outDir: string;
 }
 
-export function unpack(bundlePath: string, outDir: string): UnpackResult {
+export function unpack(bundlePath: string, outDir: string, chunkPaths: string[] = []): UnpackResult {
   const source = readFileSync(bundlePath, 'utf8');
   const bundle = detectAndParse(source);
+
+  // Merge modules from supplementary chunk files (async-split bundles)
+  for (const chunkPath of chunkPaths) {
+    const chunkSource = readFileSync(chunkPath, 'utf8');
+    if (isChunk(chunkSource)) {
+      for (const [id, mod] of parseChunkModules(chunkSource)) {
+        bundle.modules.set(id, mod);
+      }
+    }
+  }
   const outputPaths = assignOutputPaths(bundle, outDir);
 
   for (const [id, mod] of bundle.modules) {

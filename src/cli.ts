@@ -8,7 +8,7 @@ const [cmd, ...args] = process.argv.slice(2);
 
 function usage(): never {
   console.error(`Usage:
-  webpop unpack <bundle.js> [--out <dir>]
+  webpop unpack <bundle.js> [chunk1.js chunk2.js ...] [--out <dir>]
   webpop repack <dir>
 `);
   process.exit(1);
@@ -29,8 +29,9 @@ if (cmd === 'unpack') {
   const bundlePath = positional[0];
   if (!bundlePath) usage();
 
+  const chunkPaths = positional.slice(1).map(p => resolve(p));
   const outDir = flags.out ?? bundlePath.replace(/\.js$/, '') + '-unpacked';
-  const result = unpack(resolve(bundlePath), resolve(outDir));
+  const result = unpack(resolve(bundlePath), resolve(outDir), chunkPaths);
 
   console.log(`[${result.formatName}] Extracted ${result.moduleCount} modules → ${result.outDir}`);
   console.log(`Entry: ${result.entryId}`);
@@ -43,7 +44,7 @@ if (cmd === 'unpack') {
     console.error(`No webpack.config.js in ${dir}. Run 'webpop unpack' first.`);
     process.exit(1);
   }
-  if (!existsSync(join(dir, 'node_modules'))) {
+  if (!existsSync(join(dir, 'node_modules', '.bin', 'webpack'))) {
     console.log('Installing dependencies...');
     execSync('bun install', { cwd: dir, stdio: 'inherit' });
   }
