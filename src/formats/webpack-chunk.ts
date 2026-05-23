@@ -61,6 +61,7 @@ const WEBPACK_PARAM_NAMES = ['module', 'exports', '__webpack_require__'];
 function addParamShims(body: t.BlockStatement, params: t.Node[]): t.BlockStatement {
   const shims: t.Statement[] = [];
   for (let i = 0; i < Math.min(params.length, 3); i++) {
+    if (i === 2) continue; // __webpack_require__ — all usages replaced by transforms; no shim needed
     const p = params[i];
     if (!t.isIdentifier(p)) continue;
     if (p.name === WEBPACK_PARAM_NAMES[i]) continue;
