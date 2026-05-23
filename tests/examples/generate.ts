@@ -13,8 +13,8 @@
  *   SKIP_FRAMEWORKS=1 bun run generate-examples        # skip slow scaffolds
  */
 import { $ } from 'bun';
-import { existsSync, mkdirSync, readdirSync, statSync, copyFileSync, rmSync } from 'node:fs';
-import { join, resolve, basename } from 'node:path';
+import { existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 
 const ROOT = resolve(import.meta.dir);
 const DIST = join(ROOT, 'dist');
@@ -22,9 +22,6 @@ const DIST = join(ROOT, 'dist');
 type Project = {
   name: string;
   description: string;
-  framework?: boolean;
-  /** Run before install/build if the project dir doesn't yet exist. */
-  scaffold?: () => Promise<void>;
   /** Optional install command. Defaults to `bun install`. */
   install?: () => Promise<void>;
   /** Build command. Defaults to `bun run build`. */
@@ -47,55 +44,19 @@ const projects: Project[] = [
   { name: 'wp4-cjs-greet',   description: 'webpack 4 / CommonJS / dev+prod' },
   { name: 'wp4-babel-es6',   description: 'webpack 4 / babel-loader / ES6+ source / npm deps' },
   { name: 'wp3-legacy',      description: 'webpack 3 (legacy) / UglifyJsPlugin' },
-
-  // Framework starters - opt out via SKIP_FRAMEWORKS=1
-  {
-    name: 'nextjs-webpack',
-    description: 'create-next-app --webpack (Next.js scaffold using webpack instead of Turbopack)',
-    framework: true,
-    scaffold: async () => {
-      await $`bunx --bun create-next-app@latest nextjs-webpack --yes --webpack --no-tailwind --no-eslint --js --no-turbopack`
-        .cwd(ROOT);
-    },
-    install: async () => {
-      // create-next-app already installs deps; skip
-    },
-    build: async () => {
-      // Force webpack regardless of what create-next-app put in the package.json
-      // (Next.js 16 defaults to Turbopack and the --webpack scaffold flag is unreliable).
-      await $`bunx next build --webpack`
-        .cwd(dirOf('nextjs-webpack'))
-        .env({ ...process.env, NEXT_TELEMETRY_DISABLED: '1' });
-    },
-    collect: async () => {
-      // Clear any previously copied next chunks
-      for (const f of readdirSync(DIST)) {
-        if (f.startsWith('nextjs-webpack-')) rmSync(join(DIST, f));
-      }
-      const chunksDir = join(dirOf('nextjs-webpack'), '.next/static/chunks');
-      if (!existsSync(chunksDir)) {
-        console.warn(`  [nextjs-webpack] no chunks dir at ${chunksDir}; skipping collect`);
-        return;
-      }
-      for (const file of readdirSync(chunksDir)) {
-        if (!file.endsWith('.js')) continue;
-        const full = join(chunksDir, file);
-        if (!statSync(full).isFile()) continue;
-        // Sanitise the long content-hashed names and add a project prefix
-        const safe = file.replace(/[^\w.-]/g, '_').replace(/\.js$/, '.min.js');
-        copyFileSync(full, join(DIST, `nextjs-webpack-${safe}`));
-      }
-    },
-  },
 ];
 
 function listProjectDirs(): string[] {
   return readdirSync(ROOT)
     .filter((f) => {
-      const full = join(ROOT, f);
-      if (!statSync(full).isDirectory()) return false;
-      if (f === 'dist' || f === 'node_modules') return false;
-      return existsSync(join(full, 'package.json')) || projects.some((p) => p.name === f);
+      try {
+        const full = join(ROOT, f);
+        const stat = Bun.file(full);
+        if (f === 'dist' || f === 'node_modules') return false;
+        return existsSync(join(full, 'package.json')) || projects.some((p) => p.name === f);
+      } catch {
+        return false;
+      }
     })
     .sort();
 }
@@ -105,12 +66,8 @@ async function runProject(p: Project) {
   console.log(`\n=== ${p.name} === ${p.description}`);
 
   if (!existsSync(dir)) {
-    if (!p.scaffold) {
-      console.warn(`  [skip] dir missing and no scaffold defined: ${dir}`);
-      return;
-    }
-    console.log(`  scaffolding...`);
-    await p.scaffold();
+    console.warn(`  [skip] dir missing: ${dir}`);
+    return;
   }
 
   // Install
@@ -143,7 +100,6 @@ async function main() {
   const args = process.argv.slice(2);
   const filter = new Set(args.filter((a) => !a.startsWith('--')));
   const clean = args.includes('--clean');
-  const skipFrameworks = process.env.SKIP_FRAMEWORKS === '1';
 
   if (clean) {
     console.log(`Cleaning ${DIST}`);
@@ -165,7 +121,6 @@ async function main() {
 
   const toRun = projects.filter((p) => {
     if (filter.size && !filter.has(p.name)) return false;
-    if (skipFrameworks && p.framework) return false;
     return true;
   });
 
