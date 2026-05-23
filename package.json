@@ -7,7 +7,8 @@
   },
   "scripts": {
     "test": "bun test",
-    "generate-examples": "bun run tests/examples/generate.ts"
+    "generate-examples": "bun run tests/examples/generate.ts",
+    "webpop": "bun run src/cli.ts"
   },
   "dependencies": {
     "@babel/generator": "^7.29.1",
